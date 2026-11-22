@@ -1,0 +1,15 @@
+# OnePlus 8 Pro (instantnoodlep). The DSP firmware itself (.mbn) comes from
+# dsp-firmware.service, which also copies the sensor DSP libraries and the
+# proximity calibration. vendor/odm are gone (super holds the rootfs), so only
+# the protection domain maps from the modem partition are taken here: pd-mapper
+# looks for them next to the remoteproc firmware (postmarketos/*.mbn).
+[juicer]
+firmware = [
+    { partition = "modem", origin = "image", destination = "postmarketos", files = [
+            { name = "adspr.jsn" },
+            { name = "adspua.jsn" },
+            { name = "cdspr.jsn" },
+            { name = "slpir.jsn" },
+            { name = "slpius.jsn" },
+        ] },
+]

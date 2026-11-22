@@ -1,0 +1,97 @@
+From 2788998df6f11631ceaa9f03d7286db90c250bb3 Mon Sep 17 00:00:00 2001
+From: darknagel <1788603+darknagel@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:15:50 +0100
+Subject: [PATCH] qvd-modem: accept QRTR ports of any node
+
+ModemManager names the QMI port of a QRTR modem after its QRTR node.
+That is qrtr0 for a modem inside the SoC, but an external modem such as
+the SDX55 on the OnePlus 8 Pro (PCIe/MHI) shows up as qrtr3, so
+81voltd never found the modem and VoLTE could not register.
+
+Accept every QMI port whose name starts with qrtr.
+---
+ qvd-modem.c | 40 +++++++++++++++++++++++-----------------
+ 1 file changed, 23 insertions(+), 17 deletions(-)
+
+diff --git a/qvd-modem.c b/qvd-modem.c
+index efee61f..162dea3 100644
+--- a/qvd-modem.c
++++ b/qvd-modem.c
+@@ -187,6 +187,24 @@ static void on_modem_props_changed(GDBusProxy *modem,
+ 	g_variant_unref(prop);
+ }
+ 
++/*
++ * ModemManager names QRTR control ports after the QRTR node of the modem:
++ * "qrtr0" for a modem in the SoC, but e.g. "qrtr3" for an external SDX55
++ * connected over PCIe/MHI. Accept any QMI port with the "qrtr" prefix.
++ */
++static gboolean has_qrtr_port(const MMModemPortInfo *ports, guint n_ports)
++{
++	guint i;
++
++	for (i = 0; i < n_ports; i++) {
++		if (ports[i].type == MM_MODEM_PORT_TYPE_QMI
++		 && g_str_has_prefix(ports[i].name, "qrtr"))
++			return TRUE;
++	}
++
++	return FALSE;
++}
++
+ static void on_object_added(QVDConnection *conn,
+ 			    GDBusObject *object,
+ 			    gpointer data)
+@@ -195,7 +213,7 @@ static void on_object_added(QVDConnection *conn,
+ 	const MMModemPortInfo *ports;
+ 	struct qvd_pending_bearer *pending;
+ 	guint n_ports = 0, i;
+-	gboolean is_qrtr = FALSE;
++	gboolean is_qrtr;
+ 	QVDModem *ctx = QVD_MODEM(data);
+ 
+ 	modem = mm_object_get_modem(MM_OBJECT(object));
+@@ -204,13 +222,7 @@ static void on_object_added(QVDConnection *conn,
+ 
+ 	mm_modem_peek_ports(modem, &ports, &n_ports);
+ 
+-	for (i = 0; i < n_ports; i++) {
+-		if (ports[i].type == MM_MODEM_PORT_TYPE_QMI
+-		 && !strcmp(ports[i].name, "qrtr0")) {
+-			is_qrtr = TRUE;
+-			break;
+-		}
+-	}
++	is_qrtr = has_qrtr_port(ports, n_ports);
+ 
+ 	if (is_qrtr) {
+ 		g_info("New ModemManager QRTR modem detected: path: %s\n", mm_modem_get_path(modem));
+@@ -267,8 +279,8 @@ static void find_modem(gpointer memb, gpointer data)
+ 	MMModem **out = data;
+ 	MMModem *modem;
+ 	const MMModemPortInfo *ports;
+-	guint n_ports = 0, i;
+-	gboolean is_qrtr = FALSE;
++	guint n_ports = 0;
++	gboolean is_qrtr;
+ 
+ 	modem = mm_object_get_modem(memb);
+ 	if (modem == NULL)
+@@ -276,13 +288,7 @@ static void find_modem(gpointer memb, gpointer data)
+ 
+ 	mm_modem_peek_ports(modem, &ports, &n_ports);
+ 
+-	for (i = 0; i < n_ports; i++) {
+-		if (ports[i].type == MM_MODEM_PORT_TYPE_QMI
+-		 && !strcmp(ports[i].name, "qrtr0")) {
+-			is_qrtr = TRUE;
+-			break;
+-		}
+-	}
++	is_qrtr = has_qrtr_port(ports, n_ports);
+ 
+ 	if (is_qrtr)
+ 		*out = g_object_ref(modem);
+-- 
+2.43.0
+

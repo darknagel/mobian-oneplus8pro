@@ -1,0 +1,16 @@
+#!/bin/sh
+# OnePlus 8 Pro: the DSP (SLPI, CDSP, Venus) and SDX55 modem firmware is copied
+# from the phone's own partitions by dsp-firmware.service and
+# sdx55-firmware.service on the root file system. Loaded from the initramfs,
+# the remoteproc and MHI drivers find no firmware and give up, so leave them
+# out here; udev loads them from the root file system after those services.
+PREREQ=""
+case "$1" in
+	prereqs) echo "$PREREQ"; exit 0 ;;
+esac
+. /usr/share/initramfs-tools/hook-functions
+
+for m in qcom_q6v5_pas mhi_pci_generic; do
+	find "${DESTDIR}/usr/lib/modules/${version}" -name "${m}.ko*" -delete 2>/dev/null || true
+done
+depmod -b "${DESTDIR}" "${version}"

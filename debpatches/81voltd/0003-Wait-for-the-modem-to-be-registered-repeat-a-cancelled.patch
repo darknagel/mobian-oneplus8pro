@@ -1,0 +1,168 @@
+From: Timo <1788603+darknagel@users.noreply.github.com>
+Subject: [PATCH] Wait for the modem to be registered, repeat a cancelled connection
+
+The modem asks for its IMS connection right after the SIM unlock. A bearer
+that is created and connected at that moment, before ModemManager has
+initialised and enabled the modem, derails its state machine: the modem
+goes from locked straight to connecting, ends up enabled but never
+registered, and NetworkManager cannot bring up mobile data any more
+("registration in network failed: Network timeout"). Create the bearer
+only once the modem is registered.
+
+ModemManager also cancels a connection attempt that runs while it enables
+the modem or resynchronises it after resume ("operation cancelled"). The
+modem was told that its IMS connection failed and did not ask again:
+VoLTE stayed off, calls fell back to 2G and mobile data stopped during a
+call. For such errors, try again every two seconds for up to half a
+minute before giving up.
+
+Signed-off-by: Timo <1788603+darknagel@users.noreply.github.com>
+---
+--- a/qvd-connection.c
++++ b/qvd-connection.c
+@@ -22,6 +22,7 @@
+ 	MMBearerIpFamily ip_type;
+ 	gchar *addr;
+ 	gboolean requested;
++	guint connect_tries;
+ 
+ 	guint32 sub_id, conn_id;
+ 	guint8 local_id;
+@@ -140,12 +141,54 @@
+ 	conn->local_id = local_id;
+ }
+ 
++/*
++ * ModemManager cancels a connection attempt that runs while it enables the
++ * modem, which happens right after the SIM is unlocked. The modem does not
++ * ask for its IMS connection again, so try again for a while.
++ */
++#define QVD_CONNECT_TRIES	15
++#define QVD_CONNECT_INTERVAL	2
++
++static void on_connect(GObject *obj, GAsyncResult *res, gpointer data);
++
++static gboolean connect_error_is_transient(const GError *err)
++{
++	return g_error_matches(err, MM_CORE_ERROR, MM_CORE_ERROR_CANCELLED) ||
++	       g_error_matches(err, MM_CORE_ERROR, MM_CORE_ERROR_WRONG_STATE) ||
++	       g_error_matches(err, MM_CORE_ERROR, MM_CORE_ERROR_IN_PROGRESS) ||
++	       g_error_matches(err, MM_CORE_ERROR, MM_CORE_ERROR_RETRY) ||
++	       g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED);
++}
++
++static gboolean connect_retry(gpointer data)
++{
++	QVDConnection *conn = QVD_CONNECTION(data);
++
++	if (conn->requested && conn->bearer != NULL)
++		mm_bearer_connect(conn->bearer, NULL, on_connect, conn);
++	else
++		g_object_unref(conn);
++
++	return G_SOURCE_REMOVE;
++}
++
+ static void on_connect(GObject *obj, GAsyncResult *res, gpointer data)
+ {
+ 	QVDConnection *conn = QVD_CONNECTION(data);
+ 	GError *err = NULL;
+ 
+ 	mm_bearer_connect_finish(MM_BEARER(obj), res, &err);
++	if (err != NULL && conn->requested && connect_error_is_transient(err) &&
++	    ++conn->connect_tries < QVD_CONNECT_TRIES) {
++		g_warning("Failed to connect: %s, trying again\n", err->message);
++		g_clear_error(&err);
++		/* The timeout takes over the reference of this callback */
++		g_timeout_add_seconds(QVD_CONNECT_INTERVAL, connect_retry, conn);
++		return;
++	}
++
++	conn->connect_tries = 0;
++
+ 	if (err != NULL) {
+ 		g_printerr("Failed to connect: %s\n", err->message);
+ 		g_signal_emit(conn, conn_signals[CONNECT_ERR], 0, err);
+--- a/qvd-modem.c
++++ b/qvd-modem.c
+@@ -104,13 +104,48 @@
+ 
+ static void create_bearer_ready(GObject *obj, GAsyncResult *res, gpointer data);
+ 
++/*
++ * A bearer that is created and connected while ModemManager has not brought
++ * the modem up yet (SIM still locked, or just unlocked) derails its state
++ * machine: the modem ends up enabled but never registered, and no data
++ * connection can be made afterwards. Wait until the modem is registered.
++ */
++#define QVD_REGISTERED_TRIES		150
++
++static gboolean create_bearer_retry(gpointer data);
++
++static void create_bearer_when_registered(MMModem *modem, MMBearerProperties *props,
++					  GTask *task)
++{
++	guint waits;
++
++	if (g_object_get_data(G_OBJECT(task), "qvd-props") == NULL)
++		g_object_set_data_full(G_OBJECT(task), "qvd-props",
++				       g_object_ref(props), g_object_unref);
++	if (g_object_get_data(G_OBJECT(task), "qvd-modem") == NULL)
++		g_object_set_data_full(G_OBJECT(task), "qvd-modem",
++				       g_object_ref(modem), g_object_unref);
++
++	waits = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(task), "qvd-waits"));
++	if (mm_modem_get_state(modem) < MM_MODEM_STATE_REGISTERED &&
++	    waits < QVD_REGISTERED_TRIES) {
++		if (waits == 0)
++			g_warning("Modem is not registered yet, waiting with the bearer\n");
++		g_object_set_data(G_OBJECT(task), "qvd-waits", GUINT_TO_POINTER(waits + 1));
++		g_timeout_add_seconds(QVD_CREATE_BEARER_INTERVAL, create_bearer_retry, task);
++		return;
++	}
++
++	mm_modem_create_bearer(modem, props, NULL, create_bearer_ready, task);
++}
++
+ static gboolean create_bearer_retry(gpointer data)
+ {
+ 	GTask *task = G_TASK(data);
+ 	MMModem *modem = g_object_get_data(G_OBJECT(task), "qvd-modem");
+ 	MMBearerProperties *props = g_object_get_data(G_OBJECT(task), "qvd-props");
+ 
+-	mm_modem_create_bearer(modem, props, NULL, create_bearer_ready, task);
++	create_bearer_when_registered(modem, props, task);
+ 
+ 	return G_SOURCE_REMOVE;
+ }
+@@ -131,8 +166,6 @@
+ 			g_warning("Failed to create bearer: %s, trying again\n", err->message);
+ 			g_clear_error(&err);
+ 			g_object_set_data(G_OBJECT(task), "qvd-tries", GUINT_TO_POINTER(tries));
+-			g_object_set_data_full(G_OBJECT(task), "qvd-modem",
+-					       g_object_ref(obj), g_object_unref);
+ 			g_timeout_add_seconds(QVD_CREATE_BEARER_INTERVAL,
+ 					      create_bearer_retry, task);
+ 			return;
+@@ -267,9 +300,7 @@
+ 
+ 		for (i = 0; i < ctx->pending_bearers->len; i++) {
+ 			pending = ctx->pending_bearers->pdata[i];
+-			g_object_set_data_full(G_OBJECT(pending->task), "qvd-props",
+-					       g_object_ref(pending->props), g_object_unref);
+-			mm_modem_create_bearer(ctx->modem, pending->props, NULL, create_bearer_ready, pending->task);
++			create_bearer_when_registered(ctx->modem, pending->props, pending->task);
+ 			g_object_unref(pending->props);
+ 		}
+ 
+@@ -485,9 +516,7 @@
+ 
+ 			g_ptr_array_add(ctx->pending_bearers, pending);
+ 		} else {
+-			g_object_set_data_full(G_OBJECT(task), "qvd-props",
+-					       g_object_ref(props), g_object_unref);
+-			mm_modem_create_bearer(ctx->modem, props, NULL, create_bearer_ready, task);
++			create_bearer_when_registered(ctx->modem, props, task);
+ 			g_object_unref(props);
+ 		}
+ 	} else {

@@ -1,0 +1,18 @@
+# hexagonrpc 0.5.0 upstream unit for the sensor DSP. Debian ships a single
+# hexagonrpcd.service that picks the DSP per SoC and does not know SM8250;
+# the port's scripts (setup-sensors, oneplus-ota-fetch) use this name.
+# Debian's /usr/bin/hexagonrpcd is a wrapper script; run the daemon directly.
+[Unit]
+Description=Server for FastRPC remote procedure calls from Qualcomm SDSP
+ConditionPathExists=/dev/fastrpc-sdsp
+After=dsp-firmware.service
+
+[Service]
+ExecStart=/usr/libexec/hexagonrpc/hexagonrpcd -f /dev/fastrpc-sdsp -d sdsp -s
+Restart=always
+RestartSec=3
+User=fastrpc
+Group=fastrpc
+
+[Install]
+WantedBy=multi-user.target

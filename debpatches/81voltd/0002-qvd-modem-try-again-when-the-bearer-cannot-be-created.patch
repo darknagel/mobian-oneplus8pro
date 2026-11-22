@@ -1,0 +1,82 @@
+From: Timo <1788603+darknagel@users.noreply.github.com>
+Subject: [PATCH] qvd-modem: try again when the bearer cannot be created yet
+
+The modem asks for its IMS connection right after the SIM is unlocked.
+ModemManager then still initialises the modem and refuses to create a
+bearer ("modem in initializing state"). The request failed, the modem was
+told so and did not ask again, so VoLTE stayed off until 81voltd was
+restarted. Try again every two seconds for up to a minute before giving up.
+
+Signed-off-by: Timo <1788603+darknagel@users.noreply.github.com>
+---
+--- a/qvd-modem.c
++++ b/qvd-modem.c
+@@ -94,15 +94,50 @@
+ {
+ }
+ 
++/*
++ * The modem asks for its IMS connection right after the SIM is unlocked,
++ * while ModemManager still initialises the modem and refuses new bearers.
++ * The modem does not ask again, so try again for a while.
++ */
++#define QVD_CREATE_BEARER_TRIES		30
++#define QVD_CREATE_BEARER_INTERVAL	2
++
++static void create_bearer_ready(GObject *obj, GAsyncResult *res, gpointer data);
++
++static gboolean create_bearer_retry(gpointer data)
++{
++	GTask *task = G_TASK(data);
++	MMModem *modem = g_object_get_data(G_OBJECT(task), "qvd-modem");
++	MMBearerProperties *props = g_object_get_data(G_OBJECT(task), "qvd-props");
++
++	mm_modem_create_bearer(modem, props, NULL, create_bearer_ready, task);
++
++	return G_SOURCE_REMOVE;
++}
++
+ static void create_bearer_ready(GObject *obj, GAsyncResult *res, gpointer data)
+ {
+ 	GTask *task = G_TASK(data);
+ 	QVDConnection *conn;
+ 	GError *err = NULL;
+ 	MMBearer *bearer;
++	guint tries;
+ 
+ 	bearer = mm_modem_create_bearer_finish(MM_MODEM(obj), res, &err);
+ 	if (err != NULL) {
++		tries = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(task), "qvd-tries")) + 1;
++		if (tries < QVD_CREATE_BEARER_TRIES &&
++		    g_object_get_data(G_OBJECT(task), "qvd-props") != NULL) {
++			g_warning("Failed to create bearer: %s, trying again\n", err->message);
++			g_clear_error(&err);
++			g_object_set_data(G_OBJECT(task), "qvd-tries", GUINT_TO_POINTER(tries));
++			g_object_set_data_full(G_OBJECT(task), "qvd-modem",
++					       g_object_ref(obj), g_object_unref);
++			g_timeout_add_seconds(QVD_CREATE_BEARER_INTERVAL,
++					      create_bearer_retry, task);
++			return;
++		}
++
+ 		g_printerr("Failed to create bearer: %s\n", err->message);
+ 		g_task_return_error(task, err);
+ 		goto err;
+@@ -232,6 +267,8 @@
+ 
+ 		for (i = 0; i < ctx->pending_bearers->len; i++) {
+ 			pending = ctx->pending_bearers->pdata[i];
++			g_object_set_data_full(G_OBJECT(pending->task), "qvd-props",
++					       g_object_ref(pending->props), g_object_unref);
+ 			mm_modem_create_bearer(ctx->modem, pending->props, NULL, create_bearer_ready, pending->task);
+ 			g_object_unref(pending->props);
+ 		}
+@@ -448,6 +485,8 @@
+ 
+ 			g_ptr_array_add(ctx->pending_bearers, pending);
+ 		} else {
++			g_object_set_data_full(G_OBJECT(task), "qvd-props",
++					       g_object_ref(props), g_object_unref);
+ 			mm_modem_create_bearer(ctx->modem, props, NULL, create_bearer_ready, task);
+ 			g_object_unref(props);
+ 		}
