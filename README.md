@@ -16,7 +16,7 @@ patches for the Debian packages that need them.
 |---|---|
 | Display, touch, GPU, Phosh | works |
 | Wi-Fi, Bluetooth | works |
-| Audio | sound card and UCM load; playback not tested yet |
+| Audio | works |
 | ADSP, CDSP, SLPI, video firmware | works |
 | Modem (SDX55) | detected by ModemManager over QRTR, IMEI read; calls, SMS and data not tested with a SIM yet |
 | GPS | NMEA on `/dev/gnss-sdx55` |
